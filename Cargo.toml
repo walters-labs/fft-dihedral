@@ -1,0 +1,13 @@
+[package]
+name = "fft-dihedral"
+version = "0.1.0"
+edition = "2024"
+description = "Fast Fourier transforms for the dihedral group over NTT-friendly coefficient rings"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jacksonwalters/fft-dihedral"
+keywords = ["fft", "ntt", "dihedral", "finite-groups", "fourier"]
+categories = ["algorithms", "mathematics"]
+
+[dependencies]
+ntt = "0.1.9"
