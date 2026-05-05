@@ -1,5 +1,10 @@
 # fft-dihedral
 
+[![Crates.io](https://img.shields.io/crates/v/fft-dihedral.svg)](https://crates.io/crates/fft-dihedral)
+[![Docs.rs](https://docs.rs/fft-dihedral/badge.svg)](https://docs.rs/fft-dihedral)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
+
 Fast Fourier transforms for the dihedral group over NTT-friendly coefficient
 rings.
 
