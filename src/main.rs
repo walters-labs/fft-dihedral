@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use fft_dihedral::{
     DEFAULT_MODULUS, DEFAULT_PRIMITIVE_ROOT, deterministic_dihedral_function, dihedral_dft_naive,
-    dihedral_fft, flatten_transform, primitive_nth_root, root_of_unity,
+    dihedral_fft, dihedral_inverse_fft, dihedral_multiply_fft, dihedral_multiply_naive,
+    flatten_transform, primitive_nth_root, root_of_unity,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -115,8 +116,35 @@ fn run_verify(args: &[String]) {
         flatten_transform(&dihedral_dft_naive(&rotations, &reflections, modulus, omega).unwrap());
 
     assert_eq!(fast, naive);
+    let transform = dihedral_fft(&rotations, &reflections, modulus, omega).unwrap();
+    assert_eq!(
+        dihedral_inverse_fft(&transform, omega).unwrap(),
+        (rotations.clone(), reflections.clone())
+    );
+
+    let (rhs_rotations, rhs_reflections) =
+        deterministic_dihedral_function(n, seed.wrapping_add(1_000_000), modulus);
+    assert_eq!(
+        dihedral_multiply_fft(
+            &rotations,
+            &reflections,
+            &rhs_rotations,
+            &rhs_reflections,
+            modulus,
+            omega
+        )
+        .unwrap(),
+        dihedral_multiply_naive(
+            &rotations,
+            &reflections,
+            &rhs_rotations,
+            &rhs_reflections,
+            modulus
+        )
+        .unwrap()
+    );
     println!(
-        "OK: naive DFT and FFT agree for D_{} with n={n} modulo {modulus}.",
+        "OK: DFT, inverse FFT, and multiplication agree for D_{} with n={n} modulo {modulus}.",
         2 * n
     );
 }

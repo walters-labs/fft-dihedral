@@ -1,6 +1,6 @@
 [package]
 name = "fft-dihedral"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Fast Fourier transforms for the dihedral group over NTT-friendly coefficient rings"
 license = "MIT"

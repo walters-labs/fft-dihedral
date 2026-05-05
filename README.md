@@ -15,13 +15,14 @@ D_{2n} = <r, s | r^n = s^2 = e, srs^{-1} = r^{-1}>.
 ```
 
 The fast path reduces the nonabelian dihedral transform to four cyclic
-number-theoretic transforms (NTTs).
+number-theoretic transforms (NTTs). The inverse transform reconstructs two
+cyclic spectra and applies two inverse NTTs.
 
 ## Quick Start
 
 ```rust
 use fft_dihedral::{
-    DEFAULT_MODULUS, dihedral_fft, flatten_transform, root_of_unity,
+    DEFAULT_MODULUS, dihedral_fft, dihedral_inverse_fft, flatten_transform, root_of_unity,
 };
 
 let n = 16;
@@ -31,6 +32,10 @@ let reflections: Vec<u64> = (0..n).map(|k| (2 * k) as u64).collect();
 
 let transform = dihedral_fft(&rotations, &reflections, DEFAULT_MODULUS, omega)?;
 assert_eq!(flatten_transform(&transform).len(), 2 * n);
+
+let (inverse_rotations, inverse_reflections) = dihedral_inverse_fft(&transform, omega)?;
+assert_eq!(inverse_rotations, rotations);
+assert_eq!(inverse_reflections, reflections);
 # Ok::<(), fft_dihedral::Error>(())
 ```
 
@@ -69,6 +74,89 @@ fhat(rho_j) = 1/(2n) * [
 
 The one-dimensional representations are computed by direct character sums.
 
+## What The Four NTTs Do
+
+The input vector is really two vectors:
+
+```text
+rotations   = [f(1), f(r), ..., f(r^{n-1})]
+reflections = [f(s), f(sr), ..., f(sr^{n-1})]
+```
+
+The FFT applies cyclic NTTs to those two vectors with both orientations of the
+root:
+
+```text
+A^+ = NTT_omega(rotations)
+A^- = NTT_omega^{-1}(rotations)
+B^+ = NTT_omega(reflections)
+B^- = NTT_omega^{-1}(reflections)
+```
+
+For each two-dimensional irrep `rho_j`, the matrix coefficient is assembled as:
+
+```text
+1/(2n) * [[A^+[j], B^-[j]],
+          [B^+[j], A^-[j]]]
+```
+
+The inverse FFT reverses this packing. The one-dimensional coefficients recover
+the `j = 0` cyclic frequencies, and, for even `n`, the `j = n/2` frequencies.
+The two-dimensional matrices recover the paired frequencies `j` and `n-j`.
+Once the full `A^+` and `B^+` spectra have been rebuilt, two inverse NTTs give
+back the rotation and reflection coefficient vectors.
+
+## Group Algebra Multiplication
+
+Elements of the group algebra are represented by the same two arrays:
+
+```text
+x = sum_k rotations[k] r^k + sum_k reflections[k] s r^k
+```
+
+The crate provides both a quadratic reference product and an FFT product:
+
+```rust
+use fft_dihedral::{
+    DEFAULT_MODULUS, dihedral_multiply_fft, dihedral_multiply_naive, root_of_unity,
+};
+
+let n = 16;
+let omega = root_of_unity(n, DEFAULT_MODULUS)?;
+let lhs_rotations = vec![1; n];
+let lhs_reflections = vec![2; n];
+let rhs_rotations = vec![3; n];
+let rhs_reflections = vec![4; n];
+
+let fast = dihedral_multiply_fft(
+    &lhs_rotations,
+    &lhs_reflections,
+    &rhs_rotations,
+    &rhs_reflections,
+    DEFAULT_MODULUS,
+    omega,
+)?;
+let slow = dihedral_multiply_naive(
+    &lhs_rotations,
+    &lhs_reflections,
+    &rhs_rotations,
+    &rhs_reflections,
+    DEFAULT_MODULUS,
+)?;
+assert_eq!(fast, slow);
+# Ok::<(), fft_dihedral::Error>(())
+```
+
+Because the transform is normalized by `1 / |D_{2n}|`, multiplication in
+Fourier space is
+
+```text
+(x y)^hat(rho) = |D_{2n}| xhat(rho) yhat(rho).
+```
+
+So the FFT product computes two transforms, multiplies each scalar or matrix
+block with the extra factor `2n`, and then applies the inverse dihedral FFT.
+
 ## Supported Coefficient Rings
 
 The fast path uses the [`ntt`](https://crates.io/crates/ntt) crate for radix-2
@@ -100,7 +188,7 @@ pass your own root to `dihedral_fft`.
 
 ```rust
 use fft_dihedral::{
-    dihedral_dft_naive, dihedral_fft, flatten_transform, root_of_unity,
+    dihedral_dft_naive, dihedral_fft, dihedral_inverse_fft, flatten_transform, root_of_unity,
 };
 
 let n = 16;
@@ -112,6 +200,12 @@ let reflections = vec![2; n];
 let fast = flatten_transform(&dihedral_fft(&rotations, &reflections, modulus, omega)?);
 let slow = flatten_transform(&dihedral_dft_naive(&rotations, &reflections, modulus, omega)?);
 assert_eq!(fast, slow);
+
+let transform = dihedral_fft(&rotations, &reflections, modulus, omega)?;
+assert_eq!(
+    dihedral_inverse_fft(&transform, omega)?,
+    (rotations, reflections)
+);
 # Ok::<(), fft_dihedral::Error>(())
 ```
 
@@ -144,7 +238,6 @@ practical signature of the expected `O(N log N)` scaling.
 
 ## Limitations
 
-- No inverse dihedral transform yet.
 - No true extension-field `GF(p^e)` implementation yet.
 - The current implementation stores residues as `u64` and delegates the NTT to
   the `ntt` crate.

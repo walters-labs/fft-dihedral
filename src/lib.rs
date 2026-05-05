@@ -34,11 +34,18 @@
 //! currently requires `n` to be a power of two and a suitable `n`th root of
 //! unity in the coefficient ring.
 //!
+//! The inverse transform rebuilds the two cyclic spectra for the rotation and
+//! reflection coefficients, then applies two inverse NTTs. Multiplication in
+//! the group algebra is implemented by transforming both inputs, multiplying
+//! each Fourier block, scaling by `|D_{2n}|` because the transform is
+//! normalized, and applying the inverse transform.
+//!
 //! # Example
 //!
 //! ```
 //! use fft_dihedral::{
-//!     DEFAULT_MODULUS, dihedral_fft, flatten_transform, root_of_unity,
+//!     DEFAULT_MODULUS, dihedral_fft, dihedral_inverse_fft, flatten_transform,
+//!     root_of_unity,
 //! };
 //!
 //! let n = 16;
@@ -48,6 +55,10 @@
 //! let transform = dihedral_fft(&rotations, &reflections, DEFAULT_MODULUS, omega)?;
 //!
 //! assert_eq!(flatten_transform(&transform).len(), 2 * n);
+//! assert_eq!(
+//!     dihedral_inverse_fft(&transform, omega)?,
+//!     (rotations, reflections)
+//! );
 //! # Ok::<(), fft_dihedral::Error>(())
 //! ```
 //!
@@ -76,6 +87,8 @@ pub const MAX_SAFE_NTT_MODULUS: u64 = 3_037_000_499;
 /// Errors returned by checked transform constructors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// The coefficient modulus was zero.
+    ModulusIsZero,
     /// A zero-length transform was requested.
     EmptyInput,
     /// The rotation and reflection arrays had different lengths.
@@ -97,6 +110,13 @@ pub enum Error {
     ModulusTooLargeForNttBackend,
     /// The backend could not construct a suitable root of unity.
     RootUnavailable,
+    /// Two Fourier transforms had different rotation orders.
+    TransformLengthMismatch,
+    /// Two Fourier transforms used different coefficient moduli.
+    TransformModulusMismatch,
+    /// The supplied Fourier data is missing coefficients, has duplicate
+    /// coefficients, or has coefficients with impossible labels.
+    InvalidFourierData,
 }
 
 /// Labels for the one-dimensional irreducible representations.
@@ -219,6 +239,9 @@ pub fn inv_mod(value: u64, modulus: u64) -> u64 {
 }
 
 fn validate_ntt_backend_modulus(modulus: u64) -> Result<(), Error> {
+    if modulus == 0 {
+        return Err(Error::ModulusIsZero);
+    }
     if modulus > MAX_SAFE_NTT_MODULUS {
         return Err(Error::ModulusTooLargeForNttBackend);
     }
@@ -231,6 +254,9 @@ fn validate_ntt_backend_modulus(modulus: u64) -> Result<(), Error> {
 /// This helper assumes `modulus` is prime and `primitive_root` generates
 /// `GF(modulus)^*`.
 pub fn primitive_nth_root(n: usize, modulus: u64, primitive_root: u64) -> Result<u64, Error> {
+    if modulus == 0 {
+        return Err(Error::ModulusIsZero);
+    }
     if n == 0 {
         return Err(Error::EmptyInput);
     }
@@ -271,6 +297,9 @@ fn validate_dihedral_input(
     modulus: u64,
     omega: u64,
 ) -> Result<usize, Error> {
+    if modulus == 0 {
+        return Err(Error::ModulusIsZero);
+    }
     let n = rotations.len();
     if n == 0 {
         return Err(Error::EmptyInput);
@@ -478,6 +507,87 @@ fn two_dimensional_range(n: usize) -> std::ops::RangeInclusive<usize> {
     }
 }
 
+const ODD_ONE_DIMENSIONAL_REPS: [OneDimensionalRep; 2] = [
+    OneDimensionalRep::Trivial,
+    OneDimensionalRep::ReflectionSign,
+];
+
+const EVEN_ONE_DIMENSIONAL_REPS: [OneDimensionalRep; 4] = [
+    OneDimensionalRep::Trivial,
+    OneDimensionalRep::ReflectionSign,
+    OneDimensionalRep::RotationSign,
+    OneDimensionalRep::TotalSign,
+];
+
+fn expected_one_dimensional_reps(n: usize) -> &'static [OneDimensionalRep] {
+    if n.is_multiple_of(2) {
+        &EVEN_ONE_DIMENSIONAL_REPS
+    } else {
+        &ODD_ONE_DIMENSIONAL_REPS
+    }
+}
+
+fn one_dimensional_value(transform: &DihedralDft, rep: OneDimensionalRep) -> Result<u64, Error> {
+    let mut found = None;
+    for (label, value) in &transform.one_dimensional {
+        if *label == rep {
+            if found.is_some() {
+                return Err(Error::InvalidFourierData);
+            }
+            found = Some(*value % transform.modulus);
+        }
+    }
+    found.ok_or(Error::InvalidFourierData)
+}
+
+fn two_dimensional_matrices_by_index(
+    transform: &DihedralDft,
+) -> Result<Vec<Option<Matrix2>>, Error> {
+    let n = transform.n;
+    let mut matrices = vec![None; n];
+    let mut count = 0;
+    let valid_range = two_dimensional_range(n);
+
+    for (j, matrix) in &transform.two_dimensional {
+        if !valid_range.contains(j) {
+            return Err(Error::InvalidFourierData);
+        }
+        if matrices[*j].replace(*matrix).is_some() {
+            return Err(Error::InvalidFourierData);
+        }
+        count += 1;
+    }
+
+    if count != two_dimensional_range(n).count() {
+        return Err(Error::InvalidFourierData);
+    }
+
+    Ok(matrices)
+}
+
+fn validate_fourier_shape(transform: &DihedralDft) -> Result<(), Error> {
+    if transform.modulus == 0 {
+        return Err(Error::ModulusIsZero);
+    }
+    if transform.n == 0 {
+        return Err(Error::EmptyInput);
+    }
+    if transform.n < 3 {
+        return Err(Error::RotationOrderTooSmall);
+    }
+    if gcd(2 * transform.n as u64, transform.modulus) != 1 {
+        return Err(Error::GroupOrderNotInvertible);
+    }
+    if transform.one_dimensional.len() != expected_one_dimensional_reps(transform.n).len() {
+        return Err(Error::InvalidFourierData);
+    }
+    for rep in expected_one_dimensional_reps(transform.n) {
+        one_dimensional_value(transform, *rep)?;
+    }
+    two_dimensional_matrices_by_index(transform)?;
+    Ok(())
+}
+
 fn assemble_dihedral_transform(
     rotations: &[u64],
     reflections: &[u64],
@@ -594,6 +704,262 @@ pub fn dihedral_fft(
         &negative_reflections,
         modulus,
     ))
+}
+
+/// Invert a normalized fast dihedral DFT.
+///
+/// The input must have been computed with the same `omega` and modulus stored
+/// in `transform`. The returned pair uses the original coefficient convention:
+///
+/// - `rotations[k] = f(r^k)`
+/// - `reflections[k] = f(s r^k)`
+///
+/// Internally this reconstructs the two full cyclic Fourier vectors
+/// `DFT_omega(rotations)` and `DFT_omega(reflections)` from the scalar and
+/// matrix coefficients, then applies two inverse NTTs.
+pub fn dihedral_inverse_fft(
+    transform: &DihedralDft,
+    omega: u64,
+) -> Result<(Vec<u64>, Vec<u64>), Error> {
+    validate_fourier_shape(transform)?;
+    let n = transform.n;
+    let modulus = transform.modulus;
+    validate_power_of_two_root(n, omega, modulus)?;
+
+    let n_scale = n as u64 % modulus;
+    let group_order = 2 * n as u64 % modulus;
+    let mut rotation_frequencies = vec![0; n];
+    let mut reflection_frequencies = vec![0; n];
+
+    let trivial = one_dimensional_value(transform, OneDimensionalRep::Trivial)?;
+    let reflection_sign = one_dimensional_value(transform, OneDimensionalRep::ReflectionSign)?;
+    rotation_frequencies[0] = mul_mod(n_scale, add_mod(trivial, reflection_sign, modulus), modulus);
+    reflection_frequencies[0] =
+        mul_mod(n_scale, sub_mod(trivial, reflection_sign, modulus), modulus);
+
+    if n.is_multiple_of(2) {
+        let rotation_sign = one_dimensional_value(transform, OneDimensionalRep::RotationSign)?;
+        let total_sign = one_dimensional_value(transform, OneDimensionalRep::TotalSign)?;
+        rotation_frequencies[n / 2] = mul_mod(
+            n_scale,
+            add_mod(rotation_sign, total_sign, modulus),
+            modulus,
+        );
+        reflection_frequencies[n / 2] = mul_mod(
+            n_scale,
+            sub_mod(rotation_sign, total_sign, modulus),
+            modulus,
+        );
+    }
+
+    let matrices = two_dimensional_matrices_by_index(transform)?;
+    for j in two_dimensional_range(n) {
+        let matrix = matrices[j].ok_or(Error::InvalidFourierData)?;
+        let mirror = n - j;
+
+        rotation_frequencies[j] = mul_mod(matrix.a00, group_order, modulus);
+        reflection_frequencies[j] = mul_mod(matrix.a10, group_order, modulus);
+        rotation_frequencies[mirror] = mul_mod(matrix.a11, group_order, modulus);
+        reflection_frequencies[mirror] = mul_mod(matrix.a01, group_order, modulus);
+    }
+
+    Ok((
+        inverse_ntt(&rotation_frequencies, omega, modulus)?,
+        inverse_ntt(&reflection_frequencies, omega, modulus)?,
+    ))
+}
+
+fn matrix_multiply_scaled(lhs: Matrix2, rhs: Matrix2, scale: u64, modulus: u64) -> Matrix2 {
+    let entry = |a: u64, b: u64, c: u64, d: u64| {
+        mul_mod(
+            scale,
+            add_mod(mul_mod(a, b, modulus), mul_mod(c, d, modulus), modulus),
+            modulus,
+        )
+    };
+
+    Matrix2 {
+        a00: entry(lhs.a00, rhs.a00, lhs.a01, rhs.a10),
+        a01: entry(lhs.a00, rhs.a01, lhs.a01, rhs.a11),
+        a10: entry(lhs.a10, rhs.a00, lhs.a11, rhs.a10),
+        a11: entry(lhs.a10, rhs.a01, lhs.a11, rhs.a11),
+    }
+}
+
+/// Multiply two normalized dihedral Fourier transforms.
+///
+/// With the crate's normalized convention,
+/// `fhat(rho) = (1 / |D_{2n}|) sum_g f(g) rho(g)`, convolution in the group
+/// algebra becomes
+///
+/// ```text
+/// (f * h)^hat(rho) = |D_{2n}| fhat(rho) hhat(rho).
+/// ```
+///
+/// This function performs exactly that scalar or matrix multiplication on each
+/// irreducible block.
+pub fn multiply_fourier_transforms(
+    lhs: &DihedralDft,
+    rhs: &DihedralDft,
+) -> Result<DihedralDft, Error> {
+    validate_fourier_shape(lhs)?;
+    validate_fourier_shape(rhs)?;
+    if lhs.n != rhs.n {
+        return Err(Error::TransformLengthMismatch);
+    }
+    if lhs.modulus != rhs.modulus {
+        return Err(Error::TransformModulusMismatch);
+    }
+
+    let n = lhs.n;
+    let modulus = lhs.modulus;
+    let group_order = 2 * n as u64 % modulus;
+    let mut one_dimensional = Vec::with_capacity(expected_one_dimensional_reps(n).len());
+
+    for rep in expected_one_dimensional_reps(n) {
+        one_dimensional.push((
+            *rep,
+            mul_mod(
+                group_order,
+                mul_mod(
+                    one_dimensional_value(lhs, *rep)?,
+                    one_dimensional_value(rhs, *rep)?,
+                    modulus,
+                ),
+                modulus,
+            ),
+        ));
+    }
+
+    let lhs_matrices = two_dimensional_matrices_by_index(lhs)?;
+    let rhs_matrices = two_dimensional_matrices_by_index(rhs)?;
+    let mut two_dimensional = Vec::with_capacity(two_dimensional_range(n).count());
+
+    for j in two_dimensional_range(n) {
+        let lhs_matrix = lhs_matrices[j].ok_or(Error::InvalidFourierData)?;
+        let rhs_matrix = rhs_matrices[j].ok_or(Error::InvalidFourierData)?;
+        two_dimensional.push((
+            j,
+            matrix_multiply_scaled(lhs_matrix, rhs_matrix, group_order, modulus),
+        ));
+    }
+
+    Ok(DihedralDft {
+        n,
+        modulus,
+        one_dimensional,
+        two_dimensional,
+    })
+}
+
+fn validate_group_algebra_inputs(
+    lhs_rotations: &[u64],
+    lhs_reflections: &[u64],
+    rhs_rotations: &[u64],
+    rhs_reflections: &[u64],
+    modulus: u64,
+) -> Result<usize, Error> {
+    if modulus == 0 {
+        return Err(Error::ModulusIsZero);
+    }
+    let n = lhs_rotations.len();
+    if n == 0 {
+        return Err(Error::EmptyInput);
+    }
+    if n != lhs_reflections.len() || n != rhs_rotations.len() || n != rhs_reflections.len() {
+        return Err(Error::MismatchedInputLengths);
+    }
+    if n < 3 {
+        return Err(Error::RotationOrderTooSmall);
+    }
+    Ok(n)
+}
+
+/// Direct quadratic multiplication in the group algebra of `D_{2n}`.
+///
+/// This is mostly useful as a reference implementation for tests. The basis is
+/// the same as the transform input:
+///
+/// ```text
+/// rotations[k]   = coefficient of r^k
+/// reflections[k] = coefficient of s r^k
+/// ```
+pub fn dihedral_multiply_naive(
+    lhs_rotations: &[u64],
+    lhs_reflections: &[u64],
+    rhs_rotations: &[u64],
+    rhs_reflections: &[u64],
+    modulus: u64,
+) -> Result<(Vec<u64>, Vec<u64>), Error> {
+    let n = validate_group_algebra_inputs(
+        lhs_rotations,
+        lhs_reflections,
+        rhs_rotations,
+        rhs_reflections,
+        modulus,
+    )?;
+    let lhs_rotations = normalize(lhs_rotations, modulus);
+    let lhs_reflections = normalize(lhs_reflections, modulus);
+    let rhs_rotations = normalize(rhs_rotations, modulus);
+    let rhs_reflections = normalize(rhs_reflections, modulus);
+    let mut rotations = vec![0; n];
+    let mut reflections = vec![0; n];
+
+    for i in 0..n {
+        for j in 0..n {
+            let sum_index = (i + j) % n;
+            let difference_index = (j + n - i) % n;
+
+            rotations[sum_index] = add_mod(
+                rotations[sum_index],
+                mul_mod(lhs_rotations[i], rhs_rotations[j], modulus),
+                modulus,
+            );
+            rotations[difference_index] = add_mod(
+                rotations[difference_index],
+                mul_mod(lhs_reflections[i], rhs_reflections[j], modulus),
+                modulus,
+            );
+            reflections[difference_index] = add_mod(
+                reflections[difference_index],
+                mul_mod(lhs_rotations[i], rhs_reflections[j], modulus),
+                modulus,
+            );
+            reflections[sum_index] = add_mod(
+                reflections[sum_index],
+                mul_mod(lhs_reflections[i], rhs_rotations[j], modulus),
+                modulus,
+            );
+        }
+    }
+
+    Ok((rotations, reflections))
+}
+
+/// Multiply two elements of the group algebra of `D_{2n}` using the FFT.
+///
+/// The inputs are coefficient arrays in the basis `r^k` and `s r^k`. The
+/// function computes two dihedral FFTs, multiplies the Fourier blocks, and
+/// applies [`dihedral_inverse_fft`] to return the product coefficients.
+pub fn dihedral_multiply_fft(
+    lhs_rotations: &[u64],
+    lhs_reflections: &[u64],
+    rhs_rotations: &[u64],
+    rhs_reflections: &[u64],
+    modulus: u64,
+    omega: u64,
+) -> Result<(Vec<u64>, Vec<u64>), Error> {
+    validate_group_algebra_inputs(
+        lhs_rotations,
+        lhs_reflections,
+        rhs_rotations,
+        rhs_reflections,
+        modulus,
+    )?;
+    let lhs = dihedral_fft(lhs_rotations, lhs_reflections, modulus, omega)?;
+    let rhs = dihedral_fft(rhs_rotations, rhs_reflections, modulus, omega)?;
+    let product = multiply_fourier_transforms(&lhs, &rhs)?;
+    dihedral_inverse_fft(&product, omega)
 }
 
 /// Flatten Fourier data to a vector of length `2n`.
@@ -732,6 +1098,24 @@ mod tests {
     }
 
     #[test]
+    fn dihedral_inverse_fft_round_trips() {
+        for n in [4, 8, 16, 32, 64, 128] {
+            let omega = root(n);
+            for seed in 0..5 {
+                let (rotations, reflections) =
+                    deterministic_dihedral_function(n, 30_000 * n as u64 + seed, DEFAULT_MODULUS);
+                let transform =
+                    dihedral_fft(&rotations, &reflections, DEFAULT_MODULUS, omega).unwrap();
+                let (inverse_rotations, inverse_reflections) =
+                    dihedral_inverse_fft(&transform, omega).unwrap();
+
+                assert_eq!(inverse_rotations, rotations);
+                assert_eq!(inverse_reflections, reflections);
+            }
+        }
+    }
+
+    #[test]
     fn dihedral_fft_matches_naive_dft_for_random_inputs() {
         for n in [4, 8, 16, 32, 64, 128] {
             let omega = root(n);
@@ -766,6 +1150,139 @@ mod tests {
                 flatten_transform(
                     &dihedral_dft_naive(&rotations, &reflections, DEFAULT_MODULUS, omega).unwrap()
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn naive_multiplication_uses_dihedral_group_law() {
+        let n = 8;
+        let modulus = 97;
+        let zero = vec![0; n];
+
+        let mut r = vec![0; n];
+        r[1] = 1;
+        let mut s = vec![0; n];
+        s[0] = 1;
+
+        let (_, r_times_s_reflections) =
+            dihedral_multiply_naive(&r, &zero, &zero, &s, modulus).unwrap();
+        let (_, s_times_r_reflections) =
+            dihedral_multiply_naive(&zero, &s, &r, &zero, modulus).unwrap();
+
+        let mut expected_r_times_s = vec![0; n];
+        expected_r_times_s[n - 1] = 1;
+        let mut expected_s_times_r = vec![0; n];
+        expected_s_times_r[1] = 1;
+
+        assert_eq!(r_times_s_reflections, expected_r_times_s);
+        assert_eq!(s_times_r_reflections, expected_s_times_r);
+    }
+
+    #[test]
+    fn multiplying_fourier_transforms_matches_transform_of_product() {
+        for n in [4, 8, 16, 32, 64] {
+            let omega = root(n);
+            let (lhs_rotations, lhs_reflections) =
+                deterministic_dihedral_function(n, 40_000 * n as u64, DEFAULT_MODULUS);
+            let (rhs_rotations, rhs_reflections) =
+                deterministic_dihedral_function(n, 50_000 * n as u64, DEFAULT_MODULUS);
+            let (product_rotations, product_reflections) = dihedral_multiply_naive(
+                &lhs_rotations,
+                &lhs_reflections,
+                &rhs_rotations,
+                &rhs_reflections,
+                DEFAULT_MODULUS,
+            )
+            .unwrap();
+
+            let lhs_transform =
+                dihedral_fft(&lhs_rotations, &lhs_reflections, DEFAULT_MODULUS, omega).unwrap();
+            let rhs_transform =
+                dihedral_fft(&rhs_rotations, &rhs_reflections, DEFAULT_MODULUS, omega).unwrap();
+            let product_transform = dihedral_fft(
+                &product_rotations,
+                &product_reflections,
+                DEFAULT_MODULUS,
+                omega,
+            )
+            .unwrap();
+            let multiplied_transform =
+                multiply_fourier_transforms(&lhs_transform, &rhs_transform).unwrap();
+
+            assert_eq!(
+                flatten_transform(&multiplied_transform),
+                flatten_transform(&product_transform)
+            );
+        }
+    }
+
+    #[test]
+    fn dihedral_multiply_fft_matches_naive_group_algebra_product() {
+        for n in [4, 8, 16, 32, 64] {
+            let omega = root(n);
+            for seed in 0..3 {
+                let (lhs_rotations, lhs_reflections) =
+                    deterministic_dihedral_function(n, 60_000 * n as u64 + seed, DEFAULT_MODULUS);
+                let (rhs_rotations, rhs_reflections) =
+                    deterministic_dihedral_function(n, 70_000 * n as u64 + seed, DEFAULT_MODULUS);
+
+                assert_eq!(
+                    dihedral_multiply_fft(
+                        &lhs_rotations,
+                        &lhs_reflections,
+                        &rhs_rotations,
+                        &rhs_reflections,
+                        DEFAULT_MODULUS,
+                        omega,
+                    )
+                    .unwrap(),
+                    dihedral_multiply_naive(
+                        &lhs_rotations,
+                        &lhs_reflections,
+                        &rhs_rotations,
+                        &rhs_reflections,
+                        DEFAULT_MODULUS,
+                    )
+                    .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dihedral_multiply_fft_respects_identity() {
+        for n in [4, 8, 16, 32] {
+            let omega = root(n);
+            let (rotations, reflections) =
+                deterministic_dihedral_function(n, 80_000 * n as u64, DEFAULT_MODULUS);
+            let mut identity_rotations = vec![0; n];
+            identity_rotations[0] = 1;
+            let identity_reflections = vec![0; n];
+
+            assert_eq!(
+                dihedral_multiply_fft(
+                    &rotations,
+                    &reflections,
+                    &identity_rotations,
+                    &identity_reflections,
+                    DEFAULT_MODULUS,
+                    omega,
+                )
+                .unwrap(),
+                (rotations.clone(), reflections.clone())
+            );
+            assert_eq!(
+                dihedral_multiply_fft(
+                    &identity_rotations,
+                    &identity_reflections,
+                    &rotations,
+                    &reflections,
+                    DEFAULT_MODULUS,
+                    omega,
+                )
+                .unwrap(),
+                (rotations, reflections)
             );
         }
     }
