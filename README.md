@@ -222,6 +222,7 @@ cargo run --release -- verify --n 16 --modulus 97
 ```bash
 cargo run --release -- bench --min-exp 4 --max-exp 20 --repetitions 5 --naive-limit 2048
 cargo run --release -- bench --min-exp 4 --max-exp 8 --modulus 97 --repetitions 5
+cargo run --release -- bench-mul --min-exp 4 --max-exp 14 --repetitions 5 --naive-limit 1024
 ```
 
 Example release timings on the default modulus:
@@ -235,6 +236,10 @@ n       |D_{2n}|   FFT median   ns/(N log2 N)   naive median   speedup
 
 Here `N = |D_{2n}| = 2n`. The nearly flat `ns/(N log2 N)` column is the
 practical signature of the expected `O(N log N)` scaling.
+
+The `bench-mul` command compares group-algebra multiplication by FFT against
+the direct quadratic product. The fast path computes two forward dihedral FFTs,
+multiplies the Fourier blocks, and applies one inverse dihedral FFT.
 
 ## Limitations
 

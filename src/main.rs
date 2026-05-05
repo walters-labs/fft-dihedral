@@ -201,12 +201,86 @@ fn run_bench(args: &[String]) {
     }
 }
 
+fn run_bench_multiply(args: &[String]) {
+    let defaults = BenchConfig::default();
+    let config = BenchConfig {
+        min_exp: parse_u32_flag(args, "--min-exp", defaults.min_exp),
+        max_exp: parse_u32_flag(args, "--max-exp", defaults.max_exp),
+        repetitions: parse_usize_flag(args, "--repetitions", defaults.repetitions),
+        naive_limit: parse_usize_flag(args, "--naive-limit", defaults.naive_limit),
+        seed: parse_u64_flag(args, "--seed", defaults.seed),
+        modulus: parse_u64_flag(args, "--modulus", defaults.modulus),
+        omega: parse_optional_u64_flag(args, "--omega"),
+    };
+
+    println!(
+        "{:>8} {:>10} {:>14} {:>20} {:>14} {:>10}",
+        "n", "|D_{2n}|", "FFT multiply", "ns/(N log2 N)", "naive product", "speedup"
+    );
+
+    for exponent in config.min_exp..=config.max_exp {
+        let n = 1usize << exponent;
+        let group_order = 2 * n;
+        let omega = omega_for(n, config.modulus, config.omega);
+        let (lhs_rotations, lhs_reflections) =
+            deterministic_dihedral_function(n, config.seed + n as u64, config.modulus);
+        let (rhs_rotations, rhs_reflections) = deterministic_dihedral_function(
+            n,
+            config.seed.wrapping_add(1_000_000 + n as u64),
+            config.modulus,
+        );
+
+        let fast_time = time_repeated(config.repetitions, || {
+            let _ = dihedral_multiply_fft(
+                &lhs_rotations,
+                &lhs_reflections,
+                &rhs_rotations,
+                &rhs_reflections,
+                config.modulus,
+                omega,
+            )
+            .unwrap();
+        });
+        let fast_seconds = fast_time.as_secs_f64();
+        let normalized = fast_seconds * 1e9 / (group_order as f64 * (group_order as f64).log2());
+
+        let (naive_display, speedup_display) = if n <= config.naive_limit {
+            let naive_time = time_repeated(config.repetitions.min(3), || {
+                let _ = dihedral_multiply_naive(
+                    &lhs_rotations,
+                    &lhs_reflections,
+                    &rhs_rotations,
+                    &rhs_reflections,
+                    config.modulus,
+                )
+                .unwrap();
+            });
+            (
+                format_duration(naive_time),
+                format!("{:.1}x", naive_time.as_secs_f64() / fast_seconds),
+            )
+        } else {
+            ("-".to_string(), "-".to_string())
+        };
+
+        println!(
+            "{n:8} {group_order:10} {:>14} {normalized:20.2} {:>14} {:>10}",
+            format_duration(fast_time),
+            naive_display,
+            speedup_display
+        );
+    }
+}
+
 fn print_usage() {
     println!("Usage:");
     println!("  fft-dihedral verify --n 64 --modulus 2013265921 --seed 0");
     println!("  fft-dihedral verify --n 16 --modulus 97");
     println!(
         "  fft-dihedral bench --min-exp 4 --max-exp 18 --modulus 2013265921 --repetitions 3 --naive-limit 1024"
+    );
+    println!(
+        "  fft-dihedral bench-mul --min-exp 4 --max-exp 14 --modulus 2013265921 --repetitions 3 --naive-limit 1024"
     );
 }
 
@@ -215,6 +289,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("verify") => run_verify(&args[2..]),
         Some("bench") => run_bench(&args[2..]),
+        Some("bench-mul") => run_bench_multiply(&args[2..]),
         _ => {
             print_usage();
             run_bench(&[]);
