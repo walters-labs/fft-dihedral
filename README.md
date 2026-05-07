@@ -157,6 +157,37 @@ Fourier space is
 So the FFT product computes two transforms, multiplies each scalar or matrix
 block with the extra factor `2n`, and then applies the inverse dihedral FFT.
 
+## Group Algebra Inversion
+
+The crate also provides fast inversion for units in the group algebra. It
+transforms the element, inverts each scalar or `2 x 2` Fourier block, applies
+the normalization factor forced by the normalized DFT convention, and then runs
+the inverse transform.
+
+```rust
+use fft_dihedral::{
+    DEFAULT_MODULUS, dihedral_invert_fft, dihedral_multiply_fft, root_of_unity,
+};
+
+let n = 16;
+let omega = root_of_unity(n, DEFAULT_MODULUS)?;
+let mut rotations = vec![0; n];
+let reflections = vec![0; n];
+rotations[3] = 7;
+
+let inverse = dihedral_invert_fft(&rotations, &reflections, DEFAULT_MODULUS, omega)?;
+let product = dihedral_multiply_fft(
+    &rotations,
+    &reflections,
+    &inverse.0,
+    &inverse.1,
+    DEFAULT_MODULUS,
+    omega,
+)?;
+assert_eq!(product.0[0], 1);
+# Ok::<(), fft_dihedral::Error>(())
+```
+
 ## Supported Coefficient Rings
 
 The fast path uses the [`ntt`](https://crates.io/crates/ntt) crate for radix-2

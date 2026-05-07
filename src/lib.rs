@@ -44,8 +44,8 @@
 //!
 //! ```
 //! use fft_dihedral::{
-//!     DEFAULT_MODULUS, dihedral_fft, dihedral_inverse_fft, flatten_transform,
-//!     root_of_unity,
+//!     DEFAULT_MODULUS, dihedral_fft, dihedral_invert_fft, dihedral_inverse_fft,
+//!     dihedral_multiply_fft, flatten_transform, root_of_unity,
 //! };
 //!
 //! let n = 16;
@@ -57,8 +57,22 @@
 //! assert_eq!(flatten_transform(&transform).len(), 2 * n);
 //! assert_eq!(
 //!     dihedral_inverse_fft(&transform, omega)?,
-//!     (rotations, reflections)
+//!     (rotations.clone(), reflections.clone())
 //! );
+//!
+//! let mut unit_rotations = vec![0; n];
+//! unit_rotations[3] = 7;
+//! let unit_reflections = vec![0; n];
+//! let inverse = dihedral_invert_fft(&unit_rotations, &unit_reflections, DEFAULT_MODULUS, omega)?;
+//! let product = dihedral_multiply_fft(
+//!     &unit_rotations,
+//!     &unit_reflections,
+//!     &inverse.0,
+//!     &inverse.1,
+//!     DEFAULT_MODULUS,
+//!     omega,
+//! )?;
+//! assert_eq!(product.0[0], 1);
 //! # Ok::<(), fft_dihedral::Error>(())
 //! ```
 //!
@@ -117,6 +131,8 @@ pub enum Error {
     /// The supplied Fourier data is missing coefficients, has duplicate
     /// coefficients, or has coefficients with impossible labels.
     InvalidFourierData,
+    /// A group-algebra element is not invertible over the coefficient ring.
+    NonInvertibleElement,
 }
 
 /// Labels for the one-dimensional irreducible representations.
@@ -227,15 +243,27 @@ fn extended_gcd(a: i128, b: i128) -> (i128, i128, i128) {
     }
 }
 
+/// Multiplicative inverse modulo `modulus`, returning `None` for non-units.
+pub fn try_inv_mod(value: u64, modulus: u64) -> Option<u64> {
+    if modulus == 0 {
+        return None;
+    }
+    let value = value % modulus;
+    let (g, x, _) = extended_gcd(value as i128, modulus as i128);
+    if g != 1 {
+        return None;
+    }
+    Some(x.rem_euclid(modulus as i128) as u64)
+}
+
 /// Multiplicative inverse modulo `modulus`.
 ///
 /// # Panics
 ///
 /// Panics if `value` is not a unit modulo `modulus`.
 pub fn inv_mod(value: u64, modulus: u64) -> u64 {
-    let (g, x, _) = extended_gcd(value as i128, modulus as i128);
-    assert_eq!(g, 1, "{value} is not invertible modulo {modulus}");
-    x.rem_euclid(modulus as i128) as u64
+    try_inv_mod(value, modulus)
+        .unwrap_or_else(|| panic!("{value} is not invertible modulo {modulus}"))
 }
 
 fn validate_ntt_backend_modulus(modulus: u64) -> Result<(), Error> {
@@ -769,6 +797,61 @@ pub fn dihedral_inverse_fft(
     ))
 }
 
+fn matrix_inverse_scaled(matrix: Matrix2, scale: u64, modulus: u64) -> Result<Matrix2, Error> {
+    let determinant = sub_mod(
+        mul_mod(matrix.a00, matrix.a11, modulus),
+        mul_mod(matrix.a01, matrix.a10, modulus),
+        modulus,
+    );
+    let inverse_determinant =
+        try_inv_mod(determinant, modulus).ok_or(Error::NonInvertibleElement)?;
+    let scale = mul_mod(scale, inverse_determinant, modulus);
+
+    Ok(Matrix2 {
+        a00: mul_mod(scale, matrix.a11, modulus),
+        a01: mul_mod(scale, sub_mod(0, matrix.a01, modulus), modulus),
+        a10: mul_mod(scale, sub_mod(0, matrix.a10, modulus), modulus),
+        a11: mul_mod(scale, matrix.a00, modulus),
+    })
+}
+
+/// Invert a normalized dihedral Fourier transform block-by-block.
+///
+/// The crate uses the normalized convention
+/// `fhat(rho) = |D_{2n}|^{-1} sum_g f(g) rho(g)`. Since multiplication in
+/// Fourier space is `(xy)^hat = |D_{2n}| xhat yhat`, the transform of a
+/// group-algebra inverse has blocks `|D_{2n}|^{-2} xhat^{-1}`.
+pub fn invert_fourier_transform(transform: &DihedralDft) -> Result<DihedralDft, Error> {
+    validate_fourier_shape(transform)?;
+    let n = transform.n;
+    let modulus = transform.modulus;
+    let group_order = (2 * n as u64) % modulus;
+    let inverse_group_order =
+        try_inv_mod(group_order, modulus).ok_or(Error::GroupOrderNotInvertible)?;
+    let inverse_scale = mul_mod(inverse_group_order, inverse_group_order, modulus);
+
+    let mut one_dimensional = Vec::with_capacity(expected_one_dimensional_reps(n).len());
+    for rep in expected_one_dimensional_reps(n) {
+        let value = one_dimensional_value(transform, *rep)?;
+        let inverse = try_inv_mod(value, modulus).ok_or(Error::NonInvertibleElement)?;
+        one_dimensional.push((*rep, mul_mod(inverse_scale, inverse, modulus)));
+    }
+
+    let matrices = two_dimensional_matrices_by_index(transform)?;
+    let mut two_dimensional = Vec::with_capacity(two_dimensional_range(n).count());
+    for j in two_dimensional_range(n) {
+        let matrix = matrices[j].ok_or(Error::InvalidFourierData)?;
+        two_dimensional.push((j, matrix_inverse_scaled(matrix, inverse_scale, modulus)?));
+    }
+
+    Ok(DihedralDft {
+        n,
+        modulus,
+        one_dimensional,
+        two_dimensional,
+    })
+}
+
 fn matrix_multiply_scaled(lhs: Matrix2, rhs: Matrix2, scale: u64, modulus: u64) -> Matrix2 {
     let entry = |a: u64, b: u64, c: u64, d: u64| {
         mul_mod(
@@ -960,6 +1043,24 @@ pub fn dihedral_multiply_fft(
     let rhs = dihedral_fft(rhs_rotations, rhs_reflections, modulus, omega)?;
     let product = multiply_fourier_transforms(&lhs, &rhs)?;
     dihedral_inverse_fft(&product, omega)
+}
+
+/// Invert an element of the group algebra of `D_{2n}` using the FFT.
+///
+/// The inputs are coefficient arrays in the basis `r^k` and `s r^k`. The
+/// function transforms the element, inverts every Fourier scalar or `2 x 2`
+/// block, and applies [`dihedral_inverse_fft`] to return the inverse
+/// coefficients.
+pub fn dihedral_invert_fft(
+    rotations: &[u64],
+    reflections: &[u64],
+    modulus: u64,
+    omega: u64,
+) -> Result<(Vec<u64>, Vec<u64>), Error> {
+    validate_group_algebra_inputs(rotations, reflections, rotations, reflections, modulus)?;
+    let transform = dihedral_fft(rotations, reflections, modulus, omega)?;
+    let inverse = invert_fourier_transform(&transform)?;
+    dihedral_inverse_fft(&inverse, omega)
 }
 
 /// Flatten Fourier data to a vector of length `2n`.
@@ -1314,6 +1415,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dihedral_invert_fft_inverts_rotation_unit() {
+        let n = 16;
+        let modulus = DEFAULT_MODULUS;
+        let omega = root(n);
+        let mut rotations = vec![0; n];
+        let reflections = vec![0; n];
+        rotations[3] = 7;
+
+        let (inverse_rotations, inverse_reflections) =
+            dihedral_invert_fft(&rotations, &reflections, modulus, omega).unwrap();
+        let mut identity_rotations = vec![0; n];
+        identity_rotations[0] = 1;
+        let identity_reflections = vec![0; n];
+
+        assert_eq!(
+            dihedral_multiply_fft(
+                &rotations,
+                &reflections,
+                &inverse_rotations,
+                &inverse_reflections,
+                modulus,
+                omega,
+            )
+            .unwrap(),
+            (identity_rotations.clone(), identity_reflections.clone())
+        );
+        assert_eq!(
+            dihedral_multiply_fft(
+                &inverse_rotations,
+                &inverse_reflections,
+                &rotations,
+                &reflections,
+                modulus,
+                omega,
+            )
+            .unwrap(),
+            (identity_rotations, identity_reflections)
+        );
+    }
+
+    #[test]
+    fn dihedral_invert_fft_inverts_reflection_unit() {
+        let n = 16;
+        let modulus = DEFAULT_MODULUS;
+        let omega = root(n);
+        let rotations = vec![0; n];
+        let mut reflections = vec![0; n];
+        reflections[5] = 11;
+
+        let (inverse_rotations, inverse_reflections) =
+            dihedral_invert_fft(&rotations, &reflections, modulus, omega).unwrap();
+        let mut identity_rotations = vec![0; n];
+        identity_rotations[0] = 1;
+        let identity_reflections = vec![0; n];
+
+        assert_eq!(
+            dihedral_multiply_fft(
+                &rotations,
+                &reflections,
+                &inverse_rotations,
+                &inverse_reflections,
+                modulus,
+                omega,
+            )
+            .unwrap(),
+            (identity_rotations.clone(), identity_reflections.clone())
+        );
+        assert_eq!(
+            dihedral_multiply_fft(
+                &inverse_rotations,
+                &inverse_reflections,
+                &rotations,
+                &reflections,
+                modulus,
+                omega,
+            )
+            .unwrap(),
+            (identity_rotations, identity_reflections)
+        );
+    }
+
+    #[test]
+    fn dihedral_invert_fft_inverts_dense_units() {
+        for n in [8, 16, 32] {
+            let omega = root(n);
+            let mut checked = 0;
+            for seed in 0..5 {
+                let (rotations, reflections) =
+                    deterministic_dihedral_function(n, 90_000 * n as u64 + seed, DEFAULT_MODULUS);
+                let Ok((inverse_rotations, inverse_reflections)) =
+                    dihedral_invert_fft(&rotations, &reflections, DEFAULT_MODULUS, omega)
+                else {
+                    continue;
+                };
+                let mut identity_rotations = vec![0; n];
+                identity_rotations[0] = 1;
+                let identity_reflections = vec![0; n];
+
+                assert_eq!(
+                    dihedral_multiply_fft(
+                        &rotations,
+                        &reflections,
+                        &inverse_rotations,
+                        &inverse_reflections,
+                        DEFAULT_MODULUS,
+                        omega,
+                    )
+                    .unwrap(),
+                    (identity_rotations.clone(), identity_reflections.clone())
+                );
+                assert_eq!(
+                    dihedral_multiply_fft(
+                        &inverse_rotations,
+                        &inverse_reflections,
+                        &rotations,
+                        &reflections,
+                        DEFAULT_MODULUS,
+                        omega,
+                    )
+                    .unwrap(),
+                    (identity_rotations, identity_reflections)
+                );
+                checked += 1;
+            }
+            assert!(checked > 0, "expected at least one dense unit for n={n}");
+        }
+    }
+
+    #[test]
+    fn dihedral_invert_fft_rejects_zero_element() {
+        let n = 16;
+        let omega = root(n);
+        let zero = vec![0; n];
+
+        assert_eq!(
+            dihedral_invert_fft(&zero, &zero, DEFAULT_MODULUS, omega),
+            Err(Error::NonInvertibleElement)
+        );
     }
 
     #[test]
